@@ -5,8 +5,12 @@
 (define-constant err-not-found (err u103))
 (define-constant err-invalid-degree (err u104))
 (define-constant err-university-not-registered (err u105))
+(define-constant err-rating-exists (err u106))
+(define-constant err-invalid-rating (err u107))
+(define-constant err-not-employer (err u108))
 
 (define-data-var next-degree-id uint u1)
+(define-data-var next-rating-id uint u1)
 (define-data-var total-universities uint u0)
 (define-data-var total-degrees uint u0)
 
@@ -34,6 +38,31 @@
 (define-map student-degrees principal (list 50 uint))
 
 (define-map degree-owners uint principal)
+
+(define-map employers principal
+    {
+        name: (string-ascii 100),
+        verified: bool,
+        registration-block: uint
+    })
+
+(define-map degree-ratings uint
+    {
+        degree-id: uint,
+        rater: principal,
+        rating: uint,
+        comment: (string-ascii 200),
+        rating-block: uint
+    })
+
+(define-map degree-trust-scores uint
+    {
+        total-ratings: uint,
+        average-rating: uint,
+        weighted-score: uint
+    })
+
+(define-map rater-degree-key {rater: principal, degree-id: uint} uint)
 
 (define-public (register-university (university principal) (name (string-ascii 100)))
     (begin
@@ -114,6 +143,58 @@
         (map-set degree-owners degree-id new-owner)
         (ok true)))
 
+(define-public (register-employer (employer principal) (name (string-ascii 100)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none (map-get? employers employer)) err-already-exists)
+        (map-set employers employer
+            {
+                name: name,
+                verified: true,
+                registration-block: stacks-block-height
+            })
+        (ok true)))
+
+(define-public (rate-degree (degree-id uint) (rating uint) (comment (string-ascii 200)))
+    (let
+        ((rating-id (var-get next-rating-id))
+         (degree-info (unwrap! (map-get? degrees degree-id) err-not-found))
+         (rater-key {rater: tx-sender, degree-id: degree-id})
+         (existing-rating (map-get? rater-degree-key rater-key))
+         (current-trust (default-to {total-ratings: u0, average-rating: u0, weighted-score: u0} 
+                        (map-get? degree-trust-scores degree-id)))
+         (is-university (is-some (map-get? universities tx-sender)))
+         (is-employer (is-some (map-get? employers tx-sender))))
+        (asserts! (and (>= rating u1) (<= rating u10)) err-invalid-rating)
+        (asserts! (or is-university is-employer) err-not-employer)
+        (asserts! (is-none existing-rating) err-rating-exists)
+        (map-set degree-ratings rating-id
+            {
+                degree-id: degree-id,
+                rater: tx-sender,
+                rating: rating,
+                comment: comment,
+                rating-block: stacks-block-height
+            })
+        (map-set rater-degree-key rater-key rating-id)
+        (let
+            ((new-total (+ (get total-ratings current-trust) u1))
+             (total-score (+ (* (get average-rating current-trust) (get total-ratings current-trust)) rating))
+             (new-average (/ total-score new-total))
+             (weight-multiplier (if is-university u15 u10))
+             (weighted-rating (* rating weight-multiplier))
+             (current-weighted-total (* (get weighted-score current-trust) (get total-ratings current-trust)))
+             (new-weighted-total (+ current-weighted-total weighted-rating))
+             (new-weighted-score (/ new-weighted-total new-total)))
+            (map-set degree-trust-scores degree-id
+                {
+                    total-ratings: new-total,
+                    average-rating: new-average,
+                    weighted-score: new-weighted-score
+                }))
+        (var-set next-rating-id (+ rating-id u1))
+        (ok rating-id)))
+
 (define-read-only (get-university-info (university principal))
     (map-get? universities university))
 
@@ -183,3 +264,34 @@
 
 (define-read-only (get-degrees-by-university (university principal))
     (ok (list)))
+
+(define-read-only (get-employer-info (employer principal))
+    (map-get? employers employer))
+
+(define-read-only (get-degree-trust-score (degree-id uint))
+    (map-get? degree-trust-scores degree-id))
+
+(define-read-only (get-degree-rating (rating-id uint))
+    (map-get? degree-ratings rating-id))
+
+(define-read-only (get-rater-degree-rating (rater principal) (degree-id uint))
+    (match (map-get? rater-degree-key {rater: rater, degree-id: degree-id})
+        rating-id (map-get? degree-ratings rating-id)
+        none))
+
+(define-read-only (get-degree-with-reputation (degree-id uint))
+    (match (map-get? degrees degree-id)
+        degree-info
+        (match (map-get? degree-trust-scores degree-id)
+            trust-score
+            (ok {
+                degree: degree-info,
+                trust-score: trust-score,
+                has-reputation: true
+            })
+            (ok {
+                degree: degree-info,
+                trust-score: {total-ratings: u0, average-rating: u0, weighted-score: u0},
+                has-reputation: false
+            }))
+        (err err-not-found)))
