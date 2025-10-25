@@ -8,6 +8,7 @@
 (define-constant err-rating-exists (err u106))
 (define-constant err-invalid-rating (err u107))
 (define-constant err-not-employer (err u108))
+(define-constant err-credential-expired (err u109))
 
 (define-data-var next-degree-id uint u1)
 (define-data-var next-rating-id uint u1)
@@ -32,7 +33,8 @@
         graduation-year: uint,
         gpa: (string-ascii 10),
         issue-block: uint,
-        metadata-uri: (optional (string-ascii 200))
+        metadata-uri: (optional (string-ascii 200)),
+        expiry-block: (optional uint)
     })
 
 (define-map student-degrees principal (list 50 uint))
@@ -106,7 +108,8 @@
                 graduation-year: graduation-year,
                 gpa: gpa,
                 issue-block: stacks-block-height,
-                metadata-uri: metadata-uri
+                metadata-uri: metadata-uri,
+                expiry-block: none
             })
         (map-set degree-owners degree-id student)
         (map-set student-degrees student (unwrap! (as-max-len? (append current-degrees degree-id) u50) err-invalid-degree))
@@ -141,6 +144,30 @@
         ((current-owner (unwrap! (map-get? degree-owners degree-id) err-not-found)))
         (asserts! (is-eq tx-sender current-owner) err-not-authorized)
         (map-set degree-owners degree-id new-owner)
+        (ok true)))
+
+(define-public (set-degree-expiration (degree-id uint) (expiry-block uint))
+    (let
+        ((degree-info (unwrap! (map-get? degrees degree-id) err-not-found))
+         (university (get university degree-info)))
+        (asserts! (or 
+            (is-eq tx-sender university)
+            (is-eq tx-sender (default-to tx-sender (map-get? university-admins tx-sender)))
+            (is-eq tx-sender contract-owner)) err-not-authorized)
+        (map-set degrees degree-id
+            (merge degree-info { expiry-block: (some expiry-block) }))
+        (ok true)))
+
+(define-public (renew-degree (degree-id uint) (new-expiry-block uint))
+    (let
+        ((degree-info (unwrap! (map-get? degrees degree-id) err-not-found))
+         (university (get university degree-info)))
+        (asserts! (or 
+            (is-eq tx-sender university)
+            (is-eq tx-sender (default-to tx-sender (map-get? university-admins tx-sender)))
+            (is-eq tx-sender contract-owner)) err-not-authorized)
+        (map-set degrees degree-id
+            (merge degree-info { expiry-block: (some new-expiry-block) }))
         (ok true)))
 
 (define-public (register-employer (employer principal) (name (string-ascii 100)))
@@ -210,18 +237,25 @@
 (define-read-only (verify-degree (degree-id uint))
     (match (map-get? degrees degree-id)
         degree-info
-        (match (map-get? universities (get university degree-info))
-            uni-info
-            (ok {
-                valid: (get verified uni-info),
-                degree: degree-info,
-                university: (some uni-info)
-            })
-            (ok {
-                valid: false,
-                degree: degree-info,
-                university: none
-            }))
+        (let
+            ((expiry-opt (get expiry-block degree-info))
+             (is-expired (match expiry-opt
+                expiry (> stacks-block-height expiry)
+                false)))
+            (match (map-get? universities (get university degree-info))
+                uni-info
+                (ok {
+                    valid: (and (get verified uni-info) (not is-expired)),
+                    degree: degree-info,
+                    university: (some uni-info),
+                    expired: is-expired
+                })
+                (ok {
+                    valid: false,
+                    degree: degree-info,
+                    university: none,
+                    expired: is-expired
+                })))
         (err err-not-found)))
 
 (define-read-only (get-total-universities)
@@ -239,27 +273,35 @@
 (define-read-only (verify-student-degree (student principal) (degree-id uint))
     (match (map-get? degrees degree-id)
         degree-info
-        (if (is-eq (get student-address degree-info) student)
-            (match (map-get? universities (get university degree-info))
-                uni-info
+        (let
+            ((expiry-opt (get expiry-block degree-info))
+             (is-expired (match expiry-opt
+                expiry (> stacks-block-height expiry)
+                false)))
+            (if (is-eq (get student-address degree-info) student)
+                (match (map-get? universities (get university degree-info))
+                    uni-info
+                    (ok {
+                        belongs-to-student: true,
+                        verified-university: (get verified uni-info),
+                        degree: degree-info,
+                        university: (some uni-info),
+                        expired: is-expired
+                    })
+                    (ok {
+                        belongs-to-student: true,
+                        verified-university: false,
+                        degree: degree-info,
+                        university: none,
+                        expired: is-expired
+                    }))
                 (ok {
-                    belongs-to-student: true,
-                    verified-university: (get verified uni-info),
-                    degree: degree-info,
-                    university: (some uni-info)
-                })
-                (ok {
-                    belongs-to-student: true,
+                    belongs-to-student: false,
                     verified-university: false,
                     degree: degree-info,
-                    university: none
-                }))
-            (ok {
-                belongs-to-student: false,
-                verified-university: false,
-                degree: degree-info,
-                university: none
-            }))
+                    university: none,
+                    expired: is-expired
+                })))
         (err err-not-found)))
 
 (define-read-only (get-degrees-by-university (university principal))
@@ -282,16 +324,36 @@
 (define-read-only (get-degree-with-reputation (degree-id uint))
     (match (map-get? degrees degree-id)
         degree-info
-        (match (map-get? degree-trust-scores degree-id)
-            trust-score
-            (ok {
-                degree: degree-info,
-                trust-score: trust-score,
-                has-reputation: true
-            })
-            (ok {
-                degree: degree-info,
-                trust-score: {total-ratings: u0, average-rating: u0, weighted-score: u0},
-                has-reputation: false
-            }))
+        (let
+            ((expiry-opt (get expiry-block degree-info))
+             (is-expired (match expiry-opt
+                expiry (> stacks-block-height expiry)
+                false)))
+            (match (map-get? degree-trust-scores degree-id)
+                trust-score
+                (ok {
+                    degree: degree-info,
+                    trust-score: trust-score,
+                    has-reputation: true,
+                    expired: is-expired
+                })
+                (ok {
+                    degree: degree-info,
+                    trust-score: {total-ratings: u0, average-rating: u0, weighted-score: u0},
+                    has-reputation: false,
+                    expired: is-expired
+                })))
+        (err err-not-found)))
+
+(define-read-only (is-degree-expired (degree-id uint))
+    (match (map-get? degrees degree-id)
+        degree-info
+        (match (get expiry-block degree-info)
+            expiry (ok (> stacks-block-height expiry))
+            (ok false))
+        (err err-not-found)))
+
+(define-read-only (get-degree-expiration (degree-id uint))
+    (match (map-get? degrees degree-id)
+        degree-info (ok (get expiry-block degree-info))
         (err err-not-found)))
