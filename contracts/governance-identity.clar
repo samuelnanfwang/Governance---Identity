@@ -9,6 +9,8 @@
 (define-constant err-invalid-rating (err u107))
 (define-constant err-not-employer (err u108))
 (define-constant err-credential-expired (err u109))
+(define-constant err-access-denied (err u110))
+(define-constant err-access-expired (err u111))
 
 (define-data-var next-degree-id uint u1)
 (define-data-var next-rating-id uint u1)
@@ -37,7 +39,25 @@
         expiry-block: (optional uint)
     })
 
+(define-map revoked-degrees uint
+    {
+        student-address: principal,
+        university: principal,
+        degree-type: (string-ascii 50),
+        field-of-study: (string-ascii 100),
+        graduation-year: uint,
+        gpa: (string-ascii 10),
+        issue-block: uint,
+        metadata-uri: (optional (string-ascii 200)),
+        expiry-block: (optional uint),
+        revoked-block: uint,
+        revoked-by: principal,
+        reason: (string-ascii 200)
+    })
+
 (define-map student-degrees principal (list 50 uint))
+
+(define-map university-degrees principal (list 1000 uint))
 
 (define-map degree-owners uint principal)
 
@@ -65,6 +85,13 @@
     })
 
 (define-map rater-degree-key {rater: principal, degree-id: uint} uint)
+
+(define-map degree-access-grants {degree-id: uint, granted-to: principal}
+    {
+        expiration-block: uint,
+        grant-block: uint,
+        active: bool
+    })
 
 (define-public (register-university (university principal) (name (string-ascii 100)))
     (begin
@@ -96,9 +123,11 @@
     (let
         ((degree-id (var-get next-degree-id))
          (university (default-to tx-sender (map-get? university-admins tx-sender)))
-         (current-degrees (default-to (list) (map-get? student-degrees student))))
+         (current-degrees (default-to (list) (map-get? student-degrees student)))
+         (current-university-degrees (default-to (list) (map-get? university-degrees university))))
         (asserts! (is-some (map-get? universities university)) err-university-not-registered)
         (asserts! (< (len current-degrees) u50) err-invalid-degree)
+        (asserts! (< (len current-university-degrees) u1000) err-invalid-degree)
         (map-set degrees degree-id
             {
                 student-address: student,
@@ -113,6 +142,7 @@
             })
         (map-set degree-owners degree-id student)
         (map-set student-degrees student (unwrap! (as-max-len? (append current-degrees degree-id) u50) err-invalid-degree))
+        (map-set university-degrees university (unwrap! (as-max-len? (append current-university-degrees degree-id) u1000) err-invalid-degree))
         (var-set next-degree-id (+ degree-id u1))
         (var-set total-degrees (+ (var-get total-degrees) u1))
         (ok degree-id)))
@@ -126,6 +156,35 @@
             (is-eq tx-sender university)
             (is-eq tx-sender (default-to tx-sender (map-get? university-admins tx-sender)))
             (is-eq tx-sender contract-owner)) err-not-authorized)
+        (map-delete degrees degree-id)
+        (map-delete degree-owners degree-id)
+        (var-set total-degrees (- (var-get total-degrees) u1))
+        (ok true)))
+
+(define-public (revoke-degree-with-reason (degree-id uint) (reason (string-ascii 200)))
+    (let
+        ((degree-info (unwrap! (map-get? degrees degree-id) err-not-found))
+         (university (get university degree-info))
+         (student (get student-address degree-info)))
+        (asserts! (or 
+            (is-eq tx-sender university)
+            (is-eq tx-sender (default-to tx-sender (map-get? university-admins tx-sender)))
+            (is-eq tx-sender contract-owner)) err-not-authorized)
+        (map-set revoked-degrees degree-id
+            {
+                student-address: student,
+                university: university,
+                degree-type: (get degree-type degree-info),
+                field-of-study: (get field-of-study degree-info),
+                graduation-year: (get graduation-year degree-info),
+                gpa: (get gpa degree-info),
+                issue-block: (get issue-block degree-info),
+                metadata-uri: (get metadata-uri degree-info),
+                expiry-block: (get expiry-block degree-info),
+                revoked-block: stacks-block-height,
+                revoked-by: tx-sender,
+                reason: reason
+            })
         (map-delete degrees degree-id)
         (map-delete degree-owners degree-id)
         (var-set total-degrees (- (var-get total-degrees) u1))
@@ -305,7 +364,7 @@
         (err err-not-found)))
 
 (define-read-only (get-degrees-by-university (university principal))
-    (ok (list)))
+    (ok (default-to (list) (map-get? university-degrees university))))
 
 (define-read-only (get-employer-info (employer principal))
     (map-get? employers employer))
@@ -357,3 +416,80 @@
     (match (map-get? degrees degree-id)
         degree-info (ok (get expiry-block degree-info))
         (err err-not-found)))
+
+(define-public (grant-degree-access (degree-id uint) (granted-to principal) (duration-blocks uint))
+    (let
+        ((degree-info (unwrap! (map-get? degrees degree-id) err-not-found))
+         (student (get student-address degree-info))
+         (expiration (+ stacks-block-height duration-blocks)))
+        (asserts! (is-eq tx-sender student) err-not-authorized)
+        (map-set degree-access-grants {degree-id: degree-id, granted-to: granted-to}
+            {
+                expiration-block: expiration,
+                grant-block: stacks-block-height,
+                active: true
+            })
+        (ok expiration)))
+
+(define-public (revoke-degree-access (degree-id uint) (granted-to principal))
+    (let
+        ((degree-info (unwrap! (map-get? degrees degree-id) err-not-found))
+         (student (get student-address degree-info))
+         (access-grant (unwrap! (map-get? degree-access-grants {degree-id: degree-id, granted-to: granted-to}) err-not-found)))
+        (asserts! (is-eq tx-sender student) err-not-authorized)
+        (map-set degree-access-grants {degree-id: degree-id, granted-to: granted-to}
+            (merge access-grant { active: false }))
+        (ok true)))
+
+(define-read-only (has-degree-access (degree-id uint) (accessor principal))
+    (match (map-get? degrees degree-id)
+        degree-info
+        (if (is-eq accessor (get student-address degree-info))
+            (ok true)
+            (match (map-get? degree-access-grants {degree-id: degree-id, granted-to: accessor})
+                grant
+                (ok (and 
+                    (get active grant)
+                    (<= stacks-block-height (get expiration-block grant))))
+                (ok false)))
+        (err err-not-found)))
+
+(define-read-only (get-degree-access-grant (degree-id uint) (granted-to principal))
+    (map-get? degree-access-grants {degree-id: degree-id, granted-to: granted-to}))
+
+(define-read-only (get-revoked-degree (degree-id uint))
+    (map-get? revoked-degrees degree-id))
+
+(define-read-only (view-degree-with-access (degree-id uint))
+    (match (has-degree-access degree-id tx-sender)
+        has-access
+        (if has-access
+            (match (map-get? degrees degree-id)
+                degree-info
+                (let
+                    ((expiry-opt (get expiry-block degree-info))
+                     (is-expired (match expiry-opt
+                        expiry (> stacks-block-height expiry)
+                        false))
+                     (trust-score (default-to {total-ratings: u0, average-rating: u0, weighted-score: u0}
+                        (map-get? degree-trust-scores degree-id))))
+                    (match (map-get? universities (get university degree-info))
+                        uni-info
+                        (ok {
+                            degree: degree-info,
+                            university: (some uni-info),
+                            trust-score: trust-score,
+                            expired: is-expired,
+                            valid: (and (get verified uni-info) (not is-expired))
+                        })
+                        (ok {
+                            degree: degree-info,
+                            university: none,
+                            trust-score: trust-score,
+                            expired: is-expired,
+                            valid: false
+                        })))
+                err-not-found)
+            err-access-denied)
+        error-code
+        err-access-denied))
